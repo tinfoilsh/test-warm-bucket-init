@@ -35,7 +35,6 @@ containers:
     env:
       - PORT: "9001"
       - AWS_REGION: "us-east-2"
-      - MULTITENANT: "true"
     volumes:
       - "initvol:/run/init"
     # No healthcheck: the sidecar intentionally doesn't start until
