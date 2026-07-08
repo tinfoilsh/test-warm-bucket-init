@@ -38,11 +38,8 @@ containers:
       - MULTITENANT: "true"
     volumes:
       - "initvol:/run/init"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
-      interval: 30s
-      timeout: 5s
-      start_period: 60s
+    # No healthcheck: the sidecar intentionally doesn't start until
+    # /__configure writes creds. cvmimage gates on the main container.
 
 shim:
   listen-port: 443
