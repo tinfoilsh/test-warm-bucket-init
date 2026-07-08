@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -59,6 +60,7 @@ type credentials struct {
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
 	SessionToken    string `json:"session_token,omitempty"`
+	EncryptionKey   string `json:"encryption_key,omitempty"` // single-tenant mode only
 }
 
 type gate struct {
@@ -193,12 +195,20 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // writeCredsFile writes AWS creds as a shell-sourceable env file to the
 // shared volume. The buckets container's entrypoint sources this before
 // exec-ing java.
+// writeCredsFile writes AWS creds (and optional encryption key) as a
+// shell-sourceable env file. Every line is exported so that `exec java`
+// inherits them as environment variables.
 func writeCredsFile(creds credentials) error {
-	content := fmt.Sprintf("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n",
-		creds.AccessKeyID, creds.SecretAccessKey)
+	var lines []string
+	lines = append(lines, "export AWS_ACCESS_KEY_ID="+creds.AccessKeyID)
+	lines = append(lines, "export AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey)
 	if creds.SessionToken != "" {
-		content += fmt.Sprintf("AWS_SESSION_TOKEN=%s\n", creds.SessionToken)
+		lines = append(lines, "export AWS_SESSION_TOKEN="+creds.SessionToken)
 	}
+	if creds.EncryptionKey != "" {
+		lines = append(lines, "export ENCRYPTION_KEY="+creds.EncryptionKey)
+	}
+	content := strings.Join(lines, "\n") + "\n"
 	return os.WriteFile(credsFilePath, []byte(content), 0o600)
 }
 
