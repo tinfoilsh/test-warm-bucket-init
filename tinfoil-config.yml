@@ -1,0 +1,30 @@
+cvm-version: 0.10.0
+cpus: 2
+memory: 4096
+
+networks:
+  web:
+    egress: open
+
+containers:
+  - name: "buckets"
+    image: "ghcr.io/tinfoilsh/test-warm-bucket-init:latest"
+    restart: always
+    networks: [web]
+    env:
+      - PORT: "9000"
+      - AWS_REGION: "us-east-2"
+      - MULTITENANT: "true"
+    # No secrets: block — AWS creds are injected at runtime via
+    # POST /__configure after user authentication.
+
+shim:
+  listen-port: 443
+  upstream-port: 9000
+  paths:
+    - /health
+    - /__configure
+    - /__status
+    - /__kill
+    # S3 paths served by the sidecar once active:
+    - /*
