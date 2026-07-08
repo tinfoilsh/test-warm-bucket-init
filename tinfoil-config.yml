@@ -8,7 +8,7 @@ networks:
 
 containers:
   - name: "main"
-    image: "ghcr.io/tinfoilsh/test-warm-bucket-init@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/test-warm-bucket-init@sha256:b16a666db98429a77729d4624b9ee4393a3af9be2cdedfa5b26cf9276da793c8" # v0.0.1
     restart: always
     networks: [web]
     volumes:
