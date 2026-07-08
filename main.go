@@ -9,14 +9,19 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
-const (
-	proxyPort     = "9000"
-	bucketsAddr   = "buckets:9001" // docker DNS, container name "buckets"
+const proxyPort = "9000"
+
+// Overridden in main() from env vars (BUCKETS_ADDR, CREDS_FILE) for
+// local testing. Defaults match the docker-compose container layout.
+var (
+	bucketsAddr   = "buckets:9001"
 	credsFilePath = "/run/init/creds.env"
+	bucketsProxy  *httputil.ReverseProxy
 )
 
 // lifecycle follows the warm → active → killed pattern from
@@ -64,12 +69,13 @@ type gate struct {
 
 var g = &gate{state: lifecycleWarm}
 
-var bucketsProxy = httputil.NewSingleHostReverseProxy(
-	&url.URL{Scheme: "http", Host: bucketsAddr},
-)
-
 func main() {
-	os.MkdirAll("/run/init", 0o700)
+	bucketsAddr = envOr("BUCKETS_ADDR", bucketsAddr)
+	credsFilePath = envOr("CREDS_FILE", credsFilePath)
+	bucketsProxy = httputil.NewSingleHostReverseProxy(
+		&url.URL{Scheme: "http", Host: bucketsAddr},
+	)
+	os.MkdirAll(filepath.Dir(credsFilePath), 0o700)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__configure", configureHandler)
@@ -78,8 +84,15 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/", proxyHandler)
 
-	log.Printf("init-proxy listening on :%s (warm)", proxyPort)
+	log.Printf("init-proxy listening on :%s (warm), proxying to %s", proxyPort, bucketsAddr)
 	log.Fatal(http.ListenAndServe(":"+proxyPort, mux))
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func configureHandler(w http.ResponseWriter, r *http.Request) {
