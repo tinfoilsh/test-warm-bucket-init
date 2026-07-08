@@ -1,36 +1,63 @@
 # test-warm-bucket-init
 
-A warm-start proxy for [tinfoil-buckets-sidecar](https://github.com/tinfoilsh/tinfoil-buckets-sidecar). The sidecar starts **uninitialized** — no AWS credentials in the container env — and waits for a `POST /__configure` to inject them at runtime, then spawns the sidecar JAR and reverse-proxies traffic to it.
+A warm-start proxy for [tinfoil-buckets-sidecar](https://github.com/tinfoilsh/tinfoil-buckets-sidecar). The sidecar starts **uninitialized** — no AWS credentials in the container env — and waits for a `POST /__configure` to inject them at runtime, then starts serving.
 
 This lets the sidecar run inside a Tinfoil enclave without baking AWS secrets into the container definition or fetching them at boot. Credentials arrive at the application layer when a user connects.
 
+## Architecture
+
+Two containers, matching the [code-execution-environment](https://github.com/tinfoilsh/code-execution-environment) pattern:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Enclave                                             │
+│                                                      │
+│  ┌──────────────┐       ┌──────────────────────┐    │
+│  │  main        │       │  buckets              │    │
+│  │  (init-proxy)│       │  (sidecar JAR)        │    │
+│  │              │       │                       │    │
+│  │  :9000       │──────▶│  :9001                │    │
+│  │  /__configure│       │  entrypoint waits    │    │
+│  │  reverse proxy│      │  for /run/init/creds  │    │
+│  │              │       │  .env, then execs    │    │
+│  └──────┬───────┘       └────────▲─────────────┘    │
+│         │                        │                    │
+│         │  writes creds.env      │  sources it        │
+│         └────────────────────────┘                    │
+│              shared volume: initvol                   │
+└──────────────────────────────────────────────────────┘
+```
+
+- **main** (this repo): a Go binary that's PID 1 in the `main` container. Listens on `:9000`, handles `/__configure`, reverse-proxies all other traffic to `buckets:9001`.
+- **buckets**: the published sidecar image, **unchanged**. Its `entrypoint` is overridden in the config to a shell script that blocks until `/run/init/creds.env` appears on the shared volume, sources it, then `exec java -jar /app/app.jar`.
+
+The sidecar JAR is completely untouched — it still reads AWS creds from env vars at startup. The entrypoint override just delays `java -jar` until the proxy writes the creds file.
+
 ## Lifecycle
 
-Follows the `warm → active → killed` pattern from [code-execution-environment](https://github.com/tinfoilsh/code-execution-environment):
+Follows the `warm → active → killed` pattern from code-execution-environment:
 
-| State | Sidecar | `/__configure` | Other requests |
-|-------|---------|-----------------|-----------------|
-| **warm** | not started | starts sidecar, → active | 503 |
-| **active** | running on `:9001` | idempotent (same creds = no-op, different creds = restart) | proxied to sidecar |
-| **killed** | stopped | 410 | 410 |
-
-If the sidecar process dies unexpectedly while active, the proxy transitions back to **warm** so it can be reconfigured.
+| State | Buckets container | `/__configure` | Other requests |
+|-------|-------------------|-----------------|-----------------|
+| **warm** | waiting for creds file | writes creds, waits for :9001, → active | 503 |
+| **active** | running | idempotent (same creds = no-op) | proxied to buckets:9001 |
+| **killed** | n/a | 410 | 410 |
 
 ## API
 
 ### `POST /__configure`
 
-Injects AWS credentials and starts (or restarts) the sidecar.
+Injects AWS credentials. Writes them to the shared volume as a shell-sourceable env file, then waits for the buckets container to accept connections on `:9001`.
 
 ```json
 {
   "access_key_id": "AKIA...",
   "secret_access_key": "...",
-  "session_token": "..."  // optional, for STS temporary creds
+  "session_token": "..."
 }
 ```
 
-Idempotent: calling with the same creds while active returns 200 without restarting. Calling with different creds kills the old sidecar and starts a new one.
+`session_token` is optional (for STS temporary creds). Idempotent: calling with the same creds while active returns 200 without restarting.
 
 ### `GET /__status`
 
@@ -40,7 +67,7 @@ Idempotent: calling with the same creds while active returns 200 without restart
 
 ### `POST /__kill`
 
-Stops the sidecar and transitions to `killed`. Irreversible.
+Removes the creds file and transitions to `killed`. Irreversible.
 
 ### `GET /health`
 
@@ -48,50 +75,31 @@ Always returns 200 (the proxy is alive). Used by cvmimage healthchecks.
 
 ### All other paths
 
-Reverse-proxied to the sidecar on `:9001` when active.
+Reverse-proxied to `buckets:9001` when active.
 
-## How it works
-
-```
-container starts
-  └─ sidecar-init (PID 1, listens on :9000, state=warm)
-       │
-  POST /__configure {creds}
-       │
-       ├─ spawns: java -jar /app/app.jar  (env: AWS_* creds, PORT=9001, inherited AWS_REGION/MULTITENANT)
-       ├─ waits for :9001 to accept TCP
-       └─ state=active, reverse-proxies :9000 → :9001
-```
-
-The sidecar JAR is unchanged — it still reads AWS creds from env vars at startup. The proxy just delays `java -jar` until creds are available.
-
-## Docker
-
-Multi-stage build layers the Go binary on top of the published sidecar image:
-
-```dockerfile
-FROM ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:... AS sidecar
-COPY --from=build /sidecar-init /app/sidecar-init
-ENTRYPOINT ["/app/sidecar-init"]
-```
-
-The resulting image has both the sidecar JAR (`/app/app.jar`) and the init proxy (`/app/sidecar-init`). The proxy is PID 1; the sidecar is a child process spawned on configure.
-
-## tinfoil-config.yml usage
-
-The `secrets:` block is removed from the buckets container — AWS creds come at runtime:
+## tinfoil-config.yml
 
 ```yaml
 containers:
+  - name: "main"
+    image: "ghcr.io/tinfoilsh/test-warm-bucket-init@sha256:..."
+    volumes:
+      - "initvol:/run/init"
+
   - name: "buckets"
-    image: "ghcr.io/tinfoilsh/test-warm-bucket-init:latest"
-    restart: always
-    networks: [web]
+    image: "ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:..."
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while [ ! -f /run/init/creds.env ]; do sleep 0.5; done
+        . /run/init/creds.env
+        exec java -jar /app/app.jar
     env:
-      - PORT: "9000"
+      - PORT: "9001"
       - AWS_REGION: "us-east-2"
       - MULTITENANT: "true"
-    # No secrets: block — AWS creds injected via POST /__configure at runtime
+    volumes:
+      - "initvol:/run/init"
 ```
 
-The sync enclave calls `POST http://buckets:9000/__configure` with the user's AWS credentials after authenticating them, before first bucket use.
+The `buckets` container has no `secrets:` block — AWS creds arrive at runtime via `/__configure`. The sync enclave calls `POST http://main:9000/__configure` after authenticating the user, before first bucket use.

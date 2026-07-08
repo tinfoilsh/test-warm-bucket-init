@@ -9,26 +9,27 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	proxyPort   = "9000"
-	sidecarPort = "9001"
+	proxyPort     = "9000"
+	bucketsAddr   = "buckets:9001" // docker DNS, container name "buckets"
+	credsFilePath = "/run/init/creds.env"
 )
 
 // lifecycle follows the warm → active → killed pattern from
 // code-execution-environment/api-server.
 //
-//   - warm:   sidecar not started. /__configure starts it and transitions
-//             to active. All other requests return 503.
-//   - active: sidecar running. Requests are reverse-proxied to :9001.
+//   - warm:   creds not yet injected. /__configure writes creds and
+//             waits for the buckets container to start. All other
+//             requests return 503.
+//   - active: buckets container is up. Requests are reverse-proxied.
 //             /__configure with the same creds is a no-op; with different
-//             creds it restarts the sidecar.
-//   - killed: sidecar stopped. Every request returns 410.
+//             creds it rewrites the file and the buckets container
+//             restarts (via docker restart policy).
+//   - killed: session ended. Every request returns 410.
 type lifecycle int
 
 const (
@@ -56,19 +57,20 @@ type credentials struct {
 }
 
 type gate struct {
-	mu      sync.Mutex
-	state   lifecycle
-	creds   credentials
-	sidecar *exec.Cmd
+	mu    sync.Mutex
+	state lifecycle
+	creds credentials
 }
 
 var g = &gate{state: lifecycleWarm}
 
-var sidecarProxy = httputil.NewSingleHostReverseProxy(
-	&url.URL{Scheme: "http", Host: "localhost:" + sidecarPort},
+var bucketsProxy = httputil.NewSingleHostReverseProxy(
+	&url.URL{Scheme: "http", Host: bucketsAddr},
 )
 
 func main() {
+	os.MkdirAll("/run/init", 0o700)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__configure", configureHandler)
 	mux.HandleFunc("/__status", statusHandler)
@@ -76,7 +78,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/", proxyHandler)
 
-	log.Printf("sidecar-init listening on :%s (warm)", proxyPort)
+	log.Printf("init-proxy listening on :%s (warm)", proxyPort)
 	log.Fatal(http.ListenAndServe(":"+proxyPort, mux))
 }
 
@@ -110,46 +112,24 @@ func configureHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Different creds while active: kill old sidecar, start new one
-	if g.state == lifecycleActive {
-		killSidecar(g.sidecar)
-	}
-
-	cmd := buildSidecarCmd(creds)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		g.state = lifecycleWarm
-		writeJSONError(w, http.StatusInternalServerError, "failed to start sidecar: "+err.Error())
+	// Write creds to the shared volume. The buckets container's entrypoint
+	// is blocked waiting for this file to appear (first configure) or
+	// watching for it to change (reconfigure).
+	if err := writeCredsFile(creds); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to write creds: "+err.Error())
 		return
 	}
-	g.sidecar = cmd
+
+	// Wait for the buckets container to come up on its port.
+	if err := waitForBuckets(60 * time.Second); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "buckets container did not start: "+err.Error())
+		return
+	}
+
 	g.creds = creds
-
-	if err := waitForSidecar(30 * time.Second); err != nil {
-		killSidecar(cmd)
-		g.state = lifecycleWarm
-		writeJSONError(w, http.StatusInternalServerError, "sidecar failed to start: "+err.Error())
-		return
-	}
-
 	g.state = lifecycleActive
-	log.Println("sidecar started, transitioning to active")
+	log.Println("buckets container started, transitioning to active")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "active"})
-
-	// Reap the sidecar process in the background. If it exits unexpectedly
-	// while we think it's active, transition back to warm so the caller
-	// can reconfigure.
-	go func() {
-		err := cmd.Wait()
-		log.Printf("sidecar exited: %v", err)
-		g.mu.Lock()
-		if g.state == lifecycleActive && g.sidecar == cmd {
-			g.state = lifecycleWarm
-			log.Println("sidecar exited unexpectedly, back to warm")
-		}
-		g.mu.Unlock()
-	}()
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -169,9 +149,8 @@ func killHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "killed", "message": "already killed"})
 		return
 	}
-	if g.state == lifecycleActive {
-		killSidecar(g.sidecar)
-	}
+	// Remove the creds file so the buckets container can't restart.
+	os.Remove(credsFilePath)
 	g.state = lifecycleKilled
 	log.Println("killed, transitioning to killed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "killed"})
@@ -188,71 +167,39 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	case lifecycleKilled:
 		writeJSONError(w, http.StatusGone, "container session ended")
 	case lifecycleActive:
-		sidecarProxy.ServeHTTP(w, r)
+		bucketsProxy.ServeHTTP(w, r)
 	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	// Proxy is alive regardless of sidecar state. cvmimage healthchecks
+	// Proxy is alive regardless of buckets state. cvmimage healthchecks
 	// pass during warm (container is up, just not ready for traffic).
 	w.WriteHeader(http.StatusOK)
 }
 
-func buildSidecarCmd(creds credentials) *exec.Cmd {
-	cmd := exec.Command("java", "-jar", "/app/app.jar")
-	// Inherit non-secret env from the container (AWS_REGION, MULTITENANT, etc.),
-	// then inject the configured AWS creds + override PORT.
-	env := filterEnv(os.Environ(), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PORT")
-	env = append(env,
-		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
-		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
-		"PORT="+sidecarPort,
-	)
+// writeCredsFile writes AWS creds as a shell-sourceable env file to the
+// shared volume. The buckets container's entrypoint sources this before
+// exec-ing java.
+func writeCredsFile(creds credentials) error {
+	content := fmt.Sprintf("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n",
+		creds.AccessKeyID, creds.SecretAccessKey)
 	if creds.SessionToken != "" {
-		env = append(env, "AWS_SESSION_TOKEN="+creds.SessionToken)
+		content += fmt.Sprintf("AWS_SESSION_TOKEN=%s\n", creds.SessionToken)
 	}
-	cmd.Env = env
-	return cmd
+	return os.WriteFile(credsFilePath, []byte(content), 0o600)
 }
 
-func killSidecar(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if err := cmd.Process.Kill(); err != nil {
-		log.Printf("error killing sidecar: %v", err)
-	}
-}
-
-func waitForSidecar(timeout time.Duration) error {
+func waitForBuckets(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	addr := "localhost:" + sidecarPort
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", bucketsAddr, 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("sidecar did not start within %s", timeout)
-}
-
-func filterEnv(env []string, names ...string) []string {
-	drop := make(map[string]bool, len(names))
-	for _, n := range names {
-		drop[n] = true
-	}
-	var result []string
-	for _, e := range env {
-		if idx := strings.IndexByte(e, '='); idx > 0 {
-			if drop[e[:idx]] {
-				continue
-			}
-		}
-		result = append(result, e)
-	}
-	return result
+	return fmt.Errorf("buckets container did not accept connections within %s", timeout)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

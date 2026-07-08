@@ -1,4 +1,4 @@
-cvm-version: 0.10.0
+cvm-version: 0.10.4
 cpus: 2
 memory: 4096
 
@@ -7,24 +7,50 @@ networks:
     egress: open
 
 containers:
-  - name: "buckets"
-    image: "ghcr.io/tinfoilsh/test-warm-bucket-init:latest"
+  - name: "main"
+    image: "ghcr.io/tinfoilsh/test-warm-bucket-init@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
     restart: always
     networks: [web]
+    volumes:
+      - "initvol:/run/init"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+
+  - name: "buckets"
+    image: "ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:03d43dd687a5ed352f3d4956db6af706ec9dee8ca2c0fbce651ee59317b2ede5"
+    restart: always
+    networks: [web]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "buckets: waiting for creds at /run/init/creds.env..."
+        while [ ! -f /run/init/creds.env ]; do sleep 0.5; done
+        echo "buckets: creds file found, starting sidecar"
+        . /run/init/creds.env
+        exec java -jar /app/app.jar
     env:
-      - PORT: "9000"
+      - PORT: "9001"
       - AWS_REGION: "us-east-2"
       - MULTITENANT: "true"
-    # No secrets: block — AWS creds are injected at runtime via
-    # POST /__configure after user authentication.
+    volumes:
+      - "initvol:/run/init"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
 
 shim:
   listen-port: 443
   upstream-port: 9000
+  upstream-container: main
   paths:
     - /health
     - /__configure
     - /__status
     - /__kill
-    # S3 paths served by the sidecar once active:
     - /*
